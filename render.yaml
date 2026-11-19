@@ -2,7 +2,7 @@
 # Render injects $PORT; the demo entrypoint binds it. See docs/deploy.md.
 services:
   - type: web
-    name: fraud-detector-demo
+    name: fraud-detection-mlops-api
     runtime: docker
     dockerfilePath: ./Dockerfile.demo
     plan: free

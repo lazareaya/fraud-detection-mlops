@@ -1,384 +1,218 @@
-# Credit-Card Fraud Detection — End-to-End MLOps Pipeline
+# Credit-Card Fraud Detection — from model to production
 
-[![CI](https://github.com/neopentane7/mlops-fraud-detection/actions/workflows/ci.yml/badge.svg)](https://github.com/neopentane7/mlops-fraud-detection/actions/workflows/ci.yml)
-[![Security](https://github.com/neopentane7/mlops-fraud-detection/actions/workflows/security.yml/badge.svg)](https://github.com/neopentane7/mlops-fraud-detection/actions/workflows/security.yml)
-[![Live demo](https://img.shields.io/badge/live_demo-Hugging_Face_Spaces-ffab00?logo=huggingface&logoColor=white)](https://huggingface.co/spaces/neopentane7/fraud-detection-demo)
-[![Container image](https://img.shields.io/badge/image-GHCR-2496ED?logo=docker&logoColor=white)](https://github.com/neopentane7/mlops-fraud-detection/pkgs/container/mlops-fraud-detection%2Ffraud-api)
+[![CI](https://github.com/lazareaya/fraud-detection-mlops/actions/workflows/ci.yml/badge.svg)](https://github.com/lazareaya/fraud-detection-mlops/actions/workflows/ci.yml)
+[![Quality Gate](https://github.com/lazareaya/fraud-detection-mlops/actions/workflows/quality.yml/badge.svg)](https://github.com/lazareaya/fraud-detection-mlops/actions/workflows/quality.yml)
+[![E2E Smoke](https://github.com/lazareaya/fraud-detection-mlops/actions/workflows/e2e.yml/badge.svg)](https://github.com/lazareaya/fraud-detection-mlops/actions/workflows/e2e.yml)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![Lint: ruff](https://img.shields.io/badge/lint-ruff-261230?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-A **production-grade, reproducible, and monitored** machine-learning system for
-credit-card fraud detection. Every pipeline stage ships a **programmatic quality
-gate that can fail the build** — this is deliberately *not* "just train a model
-in a notebook".
+## The problem
 
-**Highlights**
+Detect fraudulent card payments among **284,807 transactions** of which only
+**0.17 % (492) are frauds** — a 577:1 class imbalance where accuracy is
+meaningless and **PR-AUC**, recall and precision on the fraud class are what count.
 
-- **Full MLOps loop:** DVC data pipeline → XGBoost with MLflow tracking &
-  registry → gated CI/CD → FastAPI serving → Evidently drift monitoring →
-  automated retraining on drift.
-- **Dataset-agnostic:** the *same* config-driven pipeline runs on **three real
-  datasets** — card fraud, credit default, and Bitcoin AML.
-- **Shipped, not just coded:** a [live public demo](https://huggingface.co/spaces/neopentane7/fraud-detection-demo)
-  serving the real model, a container image on GHCR, and a manual-approval
-  production release gate.
-- **Honest evaluation:** recall-first thresholding, a temporal-split analysis,
-  and a documented concept-drift failure case — no cherry-picked numbers.
+## Architecture
 
-> **🔴 Live demo:** score a transaction in your browser at
-> **[huggingface.co/spaces/neopentane7/fraud-detection-demo](https://huggingface.co/spaces/neopentane7/fraud-detection-demo)**
-> — open `/docs` for the Swagger UI. The Space trains the real model at build
-> time (public OpenML mirror, no secrets) and serves the FastAPI app.
+```mermaid
+flowchart TD
+    subgraph SRC["Data source"]
+        K["Kaggle"]
+        O["OpenML mirror (no auth)"]
+    end
+    K -->|creds present| DL
+    O -->|fallback| DL
 
+    subgraph PIPE["DVC pipeline (reproducible, cached)"]
+        DL["download.py"] --> VAL["validate.py<br/>Pandera gate"]
+        VAL --> PRE["preprocess.py<br/>dedup · stratified split<br/><b>DuckDB SQL features</b><br/>RobustScaler (fit on train)"]
+        PRE --> TR["train.py<br/><b>4 models compared</b><br/>XGBoost · LightGBM · RF · LogReg<br/>best by PR-AUC"]
+        TR --> EV["evaluate.py<br/>holdout benchmark + champion gates"]
+        EV --> PR["promote<br/>Staging → Production"]
+    end
+
+    TR -->|"one run per model:<br/>params, metrics, SHAP, PR/ROC"| ML[("MLflow<br/>Tracking + Registry")]
+    PR --> ML
+    ML -->|"models:/fraud-detector/Production"| API["FastAPI (Docker)<br/>/predict · /predict/batch · /health"]
+    API --> CLIENT(["Client"])
+    API -->|traffic sample| MON["Evidently drift monitor"]
+    PRE -->|reference baseline| MON
+    MON -->|drift share > 30 %| RETRAIN{{"retrain"}}
+
+    classDef gate fill:#fde2e2,stroke:#c0392b,color:#000;
+    classDef store fill:#e3f0ff,stroke:#2c6fbb,color:#000;
+    class VAL,EV gate;
+    class ML store;
 ```
-data source ─▶ DVC download ─▶ Pandera validate ─▶ preprocess ─▶ XGBoost train (MLflow)
-            ─▶ evaluate (benchmark + champion/challenger gates) ─▶ MLflow Registry
-            ─▶ FastAPI (Docker) ─▶ Evidently drift monitor ─▶ auto-retrain on drift
+
+More diagrams (DVC DAG, promotion lifecycle, serving sequence) in
+[docs/architecture.md](docs/architecture.md).
+
+## Results
+
+4 model families × 2 feature sets, same stratified 70/15/15 split (duplicates
+removed). The winner is chosen on **validation PR-AUC**; test columns are the
+untouched holdout at each model's own tuned decision threshold (highest
+precision with recall ≥ 0.85 on validation). Reproduce with
+`python scripts/compare_feature_sets.py`.
+
+| Model | Features | Val PR-AUC | Test PR-AUC | Test ROC-AUC | Test recall | Test precision | Test F1 |
+|---|---|---|---|---|---|---|---|
+| XGBoost | base | 0.865 | 0.825 | 0.972 | 0.831 | 0.584 | 0.686 |
+| **XGBoost ✅ (in production)** | **+ SQL** | **0.869** | **0.826** | **0.975** | **0.831** | **0.656** | **0.733** |
+| LightGBM | base | 0.845 | 0.782 | 0.969 | 0.803 | 0.606 | 0.691 |
+| LightGBM | + SQL | 0.855 | 0.781 | 0.967 | 0.817 | 0.468 | 0.595 |
+| Random forest | base | 0.861 | 0.829 | 0.954 | 0.817 | 0.906 | 0.859 |
+| Random forest | + SQL | 0.861 | 0.826 | 0.953 | 0.817 | 0.866 | 0.841 |
+| Logistic regression | base | 0.727 | 0.631 | 0.970 | 0.803 | 0.640 | 0.713 |
+| Logistic regression | + SQL | 0.721 | 0.634 | 0.973 | 0.803 | 0.626 | 0.704 |
+
+![Model comparison](docs/images/model_comparison.png)
+
+**What the numbers say**
+
+- **XGBoost wins on validation PR-AUC** (0.869) and is the model promoted to
+  Production. On the holdout it catches **83 % of frauds** with **66 % precision**
+  (ROC-AUC 0.975, PR-AUC 0.826) and passes every gate in
+  [evaluate.py](src/models/evaluate.py) (ROC-AUC ≥ 0.96, PR-AUC ≥ 0.80,
+  recall ≥ 0.78, precision ≥ 0.60).
+- **SQL features help XGBoost where it matters:** at the same recall, holdout
+  precision goes **0.584 → 0.656** (+7 pts, i.e. fewer false alarms per fraud
+  caught) and F1 0.686 → 0.733. Without them the model *fails* the 0.60
+  precision gate. For the other families the effect is neutral or slightly
+  negative: the engineered features mostly help the model that best exploits
+  interactions with the hour of day.
+- **Random forest is a close second** on PR-AUC with much higher precision at
+  its operating point (0.87–0.91): with a business cost that penalises false
+  alarms more, it would be the better pick — the selection metric is one line
+  in `params.yaml`.
+- **LightGBM needed a fix to be competitive:** with the default
+  `min_child_weight=1e-3` and `scale_pos_weight=24`, near-empty leaves blow up and
+  validation PR-AUC collapses to **0.17**; a hessian floor of 1 brings it to **0.85**.
+- **Logistic regression** reaches a high ROC-AUC (0.97) but a much lower PR-AUC
+  — a textbook illustration of why ROC-AUC is misleading under heavy imbalance.
+
+## Live API
+
+> **Live demo:** _deploy on Render (see [Deployment](#deployment)) and paste the
+> public URL here_ — e.g. `https://fraud-detection-mlops-api.onrender.com/docs`
+
+```bash
+curl -X POST https://<your-service>.onrender.com/predict \
+     -H "Content-Type: application/json" -d @tests/sample_transaction.json
+# {"fraud_probability":0.996,"is_fraud":true,"threshold_used":0.0875,...}
 ```
 
-![Threshold trade-off](docs/images/threshold_tradeoff.png)
+## What I added
 
-## Contents
+This project started from an MIT-licensed MLOps pipeline (see [Credits](#credits))
+that trained a single XGBoost model. My contributions:
 
-- [Why this is more than a notebook](#why-this-is-more-than-a-notebook)
-- [Datasets used for training](#datasets-used-for-training--organic-not-synthetic)
-- [Results (three datasets)](#results--three-datasets-comparable-format-public)
-- [Quick start](#quick-start-windows--powershell)
-- [Repository layout](#repository-layout)
-- [Multi-dataset design](#multi-dataset-config-driven)
-- [Engineering decisions](#engineering-decisions)
-- [CI/CD](#cicd-github-actions)
-- [Testing](#testing)
-- [Limitations & future work](#limitations--future-work)
-- [Documentation](#documentation)
+1. **Multi-model training & comparison** ([src/models/train.py](src/models/train.py)) —
+   `train.model_type: xgboost | lightgbm | logreg | random_forest | auto` in
+   [params.yaml](params.yaml). In `auto` mode the 4 families are trained, each
+   as its **own MLflow run** (nested under a comparison run) logging PR-AUC,
+   recall, precision, F1, plots, feature importances and a model artifact. The
+   best by **validation PR-AUC** is automatically registered, gated on the
+   holdout and **promoted to Production** (new `promote` DVC stage). The serving
+   wrapper ([src/models/predict.py](src/models/predict.py)) is now
+   model-agnostic, so the API serves whichever family wins.
+2. **SQL feature engineering with DuckDB** ([src/data/features.py](src/data/features.py)) —
+   `hour_of_day` (`Time % 86400 / 3600`), `log_amount` (`LN(1 + Amount)`) and
+   `amount_vs_hour_mean`, computed with a **window function**
+   `AVG(Amount) OVER (PARTITION BY hour_of_day)`. No leakage and no
+   train/serve skew: the hourly means come from the training split only, are
+   persisted, then joined onto validation, test and **live API requests** by
+   the same SQL code.
+3. **Experiment: with vs without SQL features** across all 4 models
+   ([scripts/compare_feature_sets.py](scripts/compare_feature_sets.py)): the
+   results table above.
+4. **Deployment & CI**: Render blueprint ([render.yaml](render.yaml)) for the
+   self-contained API image; CI trimmed to the workflows that run without
+   secrets (lint + mypy + tests with ≥ 80 % coverage, real-data quality gate,
+   e2e smoke); lockfiles and Docker images updated (LightGBM, DuckDB).
+5. **Tests** for every addition ([tests/test_features.py](tests/test_features.py),
+   [tests/test_train.py](tests/test_train.py)): SQL feature values, row order,
+   window-vs-join parity, API feature parity, each model family, winner
+   selection. **96 tests, 83 % coverage.**
 
-## Documentation
+## Quick start
 
-| Document | What's inside |
-| --- | --- |
-| **[results.md](docs/results.md)** | Consolidated results on all three datasets: metrics, gates, cross-dataset comparison charts, confusion matrices, literature comparison. |
-| **[model_card.md](docs/model_card.md)** | Model card — intended use, training data & provenance, metrics, ethical considerations, caveats. |
-| **[elliptic_analysis.md](docs/elliptic_analysis.md)** | Elliptic temporal evaluation reproducing Weber et al. (2019): random vs temporal split and the dark-market-shutdown concept-drift collapse. |
-| **[architecture.md](docs/architecture.md)** | Mermaid diagrams — system architecture, DVC DAG, MLflow promotion lifecycle, drift→retrain loop, request flow, CI/CD topology. |
-| **[analysis.md](docs/analysis.md)** | Charts from the real data — imbalance, PR/ROC, the threshold trade-off, feature importance, `scale_pos_weight` sweep, single-split variance. |
-| **[deploy.md](docs/deploy.md)** | Deploy the self-contained live demo (public Swagger + `/predict`) to Render / Hugging Face Spaces, no secrets. |
-| **[scaling.md](docs/scaling.md)** | Production & scaling design notes — feature store, streaming, canary deploys, delayed labels, compliance. |
+```bash
+# Python 3.11 environment
+uv venv --python 3.11 && source .venv/bin/activate
+uv pip install -r requirements.lock && uv pip install -e . --no-deps
 
-## Why this is more than a notebook
-
-| Stage | Quality gate that can fail the pipeline |
-| --- | --- |
-| `download` | Row-count plausibility check (≥ 200k rows); Kaggle → OpenML fallback |
-| `validate` | Pandera schema: dtypes, ranges, finite PCA columns, plausible fraud rate |
-| `preprocess` | Leakage guard — scaler fit on **train only**, dedup before split, stratified |
-| `train` | Performance gate — promote to Staging only if `f1_fraud ≥ performance_threshold` |
-| `evaluate` | Benchmark gate **and** challenger-must-not-regress-vs-Production gate |
-| serving | HTTP 503 (not 500) until a model is actually loaded; scaler applied to match training |
-| monitoring | Drift-share threshold (0.30) auto-triggers retraining |
-
-## Datasets used for training — organic, not synthetic
-
-Every model in this repo is trained on a **real, public** dataset (no synthetic
-training data). The pipeline ships **three** organic profiles, each fetched by
-[src/data/download.py](src/data/download.py) from the source below. The only
-synthetic data anywhere is a tiny fixture used by the test suite and the live
-demo for hermetic speed — **no reported result is trained on synthetic data.**
-
-| Profile (`MLOPS_DATASET`) | Trained on | Source (exact) | Rows / positives | Imbalance |
-| --- | --- | --- | --- | --- |
-| `creditcard` *(default)* | European-cardholder card transactions, Sept 2013; features `Time`, `Amount`, PCA `V1–V28` | Kaggle `mlg-ulb/creditcardfraud`, else public OpenML mirror `data_id=42175` (no login) | 284,807 / 492 fraud → **283,726 / 473** after dedup | **578 : 1** raw, **599 : 1** as trained |
-| `cc-default` | Taiwan credit-card client default (Yeh & Lien 2009); 23 features `x1–x23` | OpenML `data_id=42477` (no login) | 30,000 → 29,965 / 6,636 | **3.5 : 1** |
-| `elliptic` | Real Bitcoin transactions labelled illicit/licit (Weber et al. 2019); 165 node features `f1–f165` | Kaggle `ellipticco/elliptic-data-set` | 46,564 labelled / 4,545 illicit | **9.2 : 1** |
-
-Kaggle sources fall back to a no-login public mirror where one exists, so the
-pipeline reproduces anywhere. Full provenance, licences and preprocessing are in
-the **[model card](docs/model_card.md)**.
-
-## Results — three datasets, comparable format (public)
-
-Headline metrics on the held-out test split (stratified, for cross-dataset
-comparability), produced by the **same** config-driven pipeline. Full tables,
-per-dataset gates, figures, and the literature comparison are in
-**[docs/results.md](docs/results.md)**; each model is documented in the
-**[model card](docs/model_card.md)**.
-
-| Metric (positive class) | `creditcard` (fraud) | `cc-default` (default) | `elliptic` (AML) |
-| --- | --- | --- | --- |
-| ROC-AUC | **0.969** | **0.773** | **0.995** |
-| Average precision (AUPRC) | **0.826** | **0.552** | **0.981** |
-| Recall | 0.831 | 0.640 | 0.694 |
-| Precision | 0.787 | 0.445 | 0.998 |
-| F1 | 0.808 | 0.525 | 0.818 |
-| Test positives (support) | 71 | 995 | 682 |
-| Own benchmark gate | ✅ passed | ✅ passed | ✅ passed |
-
-**Every** figure above is reproduced by the pipeline and committed as a metrics
-artifact — [creditcard](metrics/creditcard/eval_metrics.json),
-[cc-default](metrics/cc-default/eval_metrics.json),
-[elliptic](metrics/elliptic/eval_metrics.json) — so every number traces to the
-run that produced it.
-
-![Model performance across all three datasets](docs/images/comparison/metrics_bar.png)
-
-The [full results](docs/results.md) include ROC/PR overlays across all datasets
-and the per-dataset figure sets (imbalance, PR/ROC, threshold trade-off,
-confusion matrix, feature importance).
-
-> `elliptic` is graph data scored **tabularly on a random split** — optimistic
-> for this dataset. On the paper's *temporal* protocol F1 is **0.753** (vs the
-> paper's RF 0.787), and a dark-market-shutdown concept-drift collapse appears;
-> see [docs/elliptic_analysis.md](docs/elliptic_analysis.md). All three land on
-> their published ROC-AUC/AUPRC ceilings — see [docs/results.md](docs/results.md).
-
-## Quick start (Windows / PowerShell)
-
-```powershell
-# 1. Environment (Python 3.11) — editable install of the package + dev extras
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"   # extras: train | api | dev (= train+api+tooling)
-
-# 2. (Optional) Kaggle credentials — skip to use the OpenML mirror automatically
-Copy-Item .env.example .env   # then fill in KAGGLE_USERNAME / KAGGLE_KEY
-
-# 3. Start the MLflow tracking server (SQLite backend + local artifacts)
+# MLflow tracking server + model registry on http://localhost:5000
 docker compose up -d mlflow
+# (without Docker: mlflow server --backend-store-uri sqlite:///mlflow-data/mlflow.db \
+#    --artifacts-destination ./mlruns --serve-artifacts --port 5000)
 
-# 4. Run the full pipeline (download -> validate -> preprocess -> train -> evaluate)
-dvc init --no-scm
+# Full pipeline: download -> validate -> preprocess -> train (4 models) -> evaluate -> promote
+export MLFLOW_TRACKING_URI=http://localhost:5000
 dvc repro
 
-# 5. Serve the production model and smoke-test it
-docker compose up --build api
-curl http://localhost:8000/health
-curl -X POST http://localhost:8000/predict -H "Content-Type: application/json" -d "@tests/sample_transaction.json"
+# With vs without SQL features (8 runs)
+python scripts/compare_feature_sets.py
 
-# 6. Drift monitoring (dry-run with injected drift)
+# Tests, API, drift monitoring
+make test
+docker compose up --build api          # http://localhost:8000/docs
 python src/monitoring/detect_drift.py --simulate-drift
 ```
 
-`make` shortcuts (`setup`, `pipeline`, `train`, `serve`, `test`, `lint`,
-`drift`, `clean`) are in the [Makefile](Makefile).
+> macOS + LightGBM: install OpenMP first (`brew install libomp`).
+
+## Deployment
+
+The API is deployed from [Dockerfile.demo](Dockerfile.demo), a self-contained
+image that downloads the public data, runs the pipeline (4-model comparison
+included) **at build time** and serves the winning model: no secrets, no
+tracking server, and it fits Render's free tier.
+
+1. Create a free account on [render.com](https://render.com) and connect GitHub.
+2. **New → Blueprint** → select this repository: Render reads
+   [render.yaml](render.yaml), then builds and deploys the API.
+3. Open `https://<service>.onrender.com/docs` (the free tier sleeps after
+   15 min idle; the first request takes about a minute to wake it).
+
+## CI/CD (GitHub Actions)
+
+- **[ci.yml](.github/workflows/ci.yml)**: ruff, mypy, pytest with an 80 %
+  coverage gate, DVC DAG validation.
+- **[quality.yml](.github/workflows/quality.yml)**: trains on a real public
+  dataset (OpenML, no secrets) and fails the build if the model regresses below
+  its benchmark gate.
+- **[e2e.yml](.github/workflows/e2e.yml)**: the whole loop on a synthetic
+  profile: train → register → promote → serve → `POST /predict`.
+
+## Stack
+
+Python 3.11 · **SQL (DuckDB)** · pandas · scikit-learn · **XGBoost** ·
+**LightGBM** · MLflow (tracking + model registry) · DVC · Pandera · SHAP ·
+Evidently · FastAPI · Pydantic v2 · Docker · GitHub Actions · pytest · ruff · mypy
 
 ## Repository layout
 
 ```
-src/config.py            Typed dataclass config loader + canonical paths (single source of params)
-src/data/                download.py (Kaggle/OpenML) · validate.py (Pandera) · preprocess.py
-src/models/              train.py (MLflow) · evaluate.py (gates) · predict.py (pyfunc wrapper)
-src/monitoring/          detect_drift.py (Evidently)
-api/                     main.py (FastAPI lifespan) · schemas.py · Dockerfile
-scripts/                 promote_model.py · cv_evaluate.py (K-fold gating) · integration_test.py
-.github/workflows/       7 workflows: ci · quality · e2e · cd · retrain · monitor · security
-dvc.yaml / params.yaml   5-stage pipeline + all tunable parameters
-tests/                   hermetic pytest suite (synthetic fixture, 80% coverage gate)
+src/data/        download.py · validate.py (Pandera) · features.py (DuckDB SQL) · preprocess.py
+src/models/      train.py (4-model comparison, MLflow) · evaluate.py (gates) · predict.py (pyfunc)
+src/monitoring/  detect_drift.py (Evidently)
+api/             FastAPI app, schemas, Dockerfile
+scripts/         compare_feature_sets.py · promote_model.py · e2e_smoke.py · cv_evaluate.py
+docs/            architecture.md · model_comparison.md · upstream_readme.md
+dvc.yaml         download → validate → preprocess → train → evaluate → promote
 ```
 
-## Multi-dataset (config-driven)
+## Credits
 
-The pipeline is **dataset-agnostic**: the schema (feature/scaled/target columns,
-validation bounds), the benchmark gate, and per-dataset training overrides live
-as profiles in the `data` section of [params.yaml](params.yaml). Select one with
-the `MLOPS_DATASET` env var; outputs are namespaced per dataset so runs never
-collide. It ships with three organic profiles — `creditcard` (card fraud),
-`cc-default` (credit-card default, OpenML 42477), and `elliptic` (real Bitcoin
-transactions labelled illicit/licit, Kaggle `ellipticco/elliptic-data-set`) —
-and the *identical* stage code runs on all of them:
-
-```bash
-MLOPS_DATASET=cc-default MLFLOW_TRACKING_URI=sqlite:///mlflow.db \
-  python src/data/download.py && python src/data/validate.py && \
-  python src/data/preprocess.py && python src/models/train.py && \
-  python src/models/evaluate.py --stage holdout
-```
-
-See [docs/second_dataset_demo.md](docs/second_dataset_demo.md) for the full
-second-dataset run (it matched the published ROC-AUC ≈ 0.77 ceiling).
-
-## Model performance — measured on the real data
-
-Targets are **calibrated from a 5-fold x 5-seed cross-validation on the real,
-deduplicated dataset** (25 models), not copied from an aspirational spec.
-Reproduce with [scripts/cv_evaluate.py](scripts/cv_evaluate.py); the per-fold
-results are committed as
-[metrics/creditcard/cv_metrics.json](metrics/creditcard/cv_metrics.json). `evaluate` fails
-explicitly, naming the offending metric, if any target is missed. Overall
-accuracy is never reported — it is meaningless at 577:1.
-
-| Metric | Gate | Measured (holdout) | Why this floor |
-| --- | --- | --- | --- |
-| `roc_auc` | ≥ 0.96 | 0.969 | threshold-independent, stable (**0.981 ± 0.009** over 25 CV folds) |
-| `avg_precision` (AUPRC) | ≥ 0.80 | 0.826 | the right summary under imbalance (**0.851 ± 0.035** over 25 CV folds) |
-| `recall_fraud` | ≥ 0.78 | 0.831 | business priority — catch the fraud |
-| `precision_fraud` | ≥ 0.60 | 0.787 | "not-collapsed" floor; precision-at-fixed-recall is noisy with ~71 holdout frauds |
-
-### Empirical findings
-
-* **Generalization is strong on the stable metrics**: ROC-AUC **0.981 ± 0.009**
-  and AUPRC **0.851 ± 0.035** across 25 folds — consistent with published results.
-* **The original "precision ≥ 0.82 *and* recall ≥ 0.78 simultaneously" goal is
-  not reliably achievable on a single split.** With only ~71–95 frauds per
-  evaluation fold and a steep PR curve, the operating point is high-variance.
-  Across the 25 CV folds precision spans **0.109 to 0.973** (std 0.228) while
-  ROC-AUC spans 0.958 to 0.994 (std 0.009) — a **26x** difference in spread.
-  The five-split study behind [analysis.md](docs/analysis.md) reproduces this
-  independently (precision 0.057–0.891, recall 0.789–0.887). It is intrinsic to
-  the data's extreme rarity — not a code defect.
-* **Single-split gating would be flaky: 13 of 25 folds (52%) miss at least one
-  benchmark target, while the fold *mean* clears every one of them.** The worst
-  fold scored ROC-AUC 0.984 and AUPRC 0.888 — a perfectly good model — yet
-  precision 0.109, because its tuned threshold collapsed to 0.003 and flagged
-  almost everything. The failure is in the *operating point*, not model quality,
-  which is exactly why the gate leans on threshold-independent metrics.
-* **What changed because of that**: recall-first thresholding, exact-duplicate
-  removal before splitting (~1k dupes that otherwise leak train→test), and
-  CV-tuned hyperparameters (depth-4 / 400 trees / `scale_pos_weight=24`), plus
-  benchmark targets recalibrated to what the data supports.
-
-## Engineering decisions
-
-**Why XGBoost over a neural network?** Tabular data, 30 features, sparse
-positives — gradient boosting achieves competitive AUC with far less compute
-and full SHAP interpretability. A NN would need heavy regularisation to avoid
-memorising the rare class.
-
-**Why `scale_pos_weight` over SMOTE?** SMOTE fabricates synthetic frauds by
-interpolation that may not represent real attack vectors; reweighting the loss
-adjusts for imbalance without inventing data. The value was **tuned to 24** —
-the naive 577 destroyed probability calibration without improving AUPRC.
-
-**Why recall-first thresholding (not max-F1, not 0.5)?** Maximising F1 drifts to
-a precision-heavy threshold (≈0.99) that drops recall to ~0.70 — contradicting
-the business priority. The pipeline picks the highest-precision threshold whose
-validation recall ≥ `min_recall` (0.85): the PR-curve boundary. A missed fraud
-costs far more than a false alarm.
-
-**Why the MLflow Model Registry over model files?** Deployment is a registry
-stage transition (`Staging → Production`) — no code change, no redeploy, fully
-auditable. The API always loads `models:/fraud-detector/Production`.
-
-**Why apply the scaler at serving time?** The model trains on scaled
-`Time`/`Amount`; the API receives raw values. The fitted `RobustScaler` is
-loaded at startup and applied before scoring to eliminate train/serve skew.
-
-**Why Evidently over hand-rolled tests?** It picks the right statistical test
-per column and emits both HTML (humans) and JSON (the decision gate). The 0.30
-drift-share threshold is conservative — over-triggering retraining is cheaper
-than missing real distribution shift in fraud.
-
-## Edge cases found and fixed
-
-| Severity | Issue | Fix |
-| --- | --- | --- |
-| 🔴 Critical | Train/serve skew — API fed **raw** `Time`/`Amount` to a model trained on **scaled** values | Load + apply the fitted scaler at serving ([api/main.py](api/main.py)) |
-| 🟠 High | `NaN`/`Infinity` accepted by JSON floats, corrupting scoring | Pydantic `field_validator` rejects non-finite ([api/schemas.py](api/schemas.py)) |
-| 🟠 High | Degenerate threshold tuning on zero-fraud / flat-probability splits | Recall-floor with F1/0.5 fallbacks ([src/models/train.py](src/models/train.py)) |
-| 🟠 High | Max-F1 threshold sacrificed recall (business inversion) | Recall-first thresholding |
-| 🟡 Medium | ~1,081 duplicate rows leaking train→test | `drop_duplicates()` before split ([src/data/preprocess.py](src/data/preprocess.py)) |
-| 🟡 Medium | `load_threshold()` default-arg bound at import (config ignored) | Resolve module global at call time ([src/models/evaluate.py](src/models/evaluate.py)) |
-
-## CI/CD (GitHub Actions)
-
-Seven workflows, each with a distinct responsibility. All run without secrets
-unless noted.
-
-* **ci.yml** (push/PR) — ruff, mypy, pytest (≥ 80% coverage), and DVC DAG
-  validation. With Kaggle secrets configured, it additionally runs a quick train,
-  an `f1_fraud` gate, and a metrics pull-request comment.
-* **quality.yml** (push/PR) — downloads `cc-default` from OpenML and enforces its
-  benchmark gate (roc_auc ≥ 0.74, recall ≥ 0.55, …); a regression below the bar
-  fails the build. Real-data quality assurance without secrets.
-* **e2e.yml** (push/PR) — the full loop on the synthetic profile: validate →
-  preprocess → train → register + promote in a local SQLite registry → serve via
-  FastAPI → `POST /predict`. Driver: [scripts/e2e_smoke.py](scripts/e2e_smoke.py).
-* **cd.yml** (manual) — Continuous Delivery. Stage 1 (automated): train → holdout
-  gate → build image → Trivy image scan (blocks on fixable CRITICALs) → container
-  integration test → publish a SHA-versioned candidate to GHCR. Stage 2
-  (`release-production`): promote the candidate to `:latest`, gated by a manual
-  approval via the `production` GitHub Environment (configure "Required
-  reviewers" in repository settings).
-* **retrain.yml** (manual / drift dispatch) — retrains a challenger, evaluates it,
-  and promotes only when it beats the Production model's `f1_fraud` by ≥ 2%.
-* **monitor.yml** (weekly cron / manual) — builds a reference baseline and runs
-  a real Evidently comparison, dispatching `retrain` only when the drift share
-  exceeds the threshold. Note the *inputs* are synthetic: the reference and the
-  "current traffic" are both drawn from the `e2e` profile, so the scheduled run
-  exercises the detector and the dispatch wiring, not live traffic. Scoring real
-  traffic would need the API to persist features; it deliberately logs only a
-  SHA-256 hash of each payload (see Limitations).
-* **security.yml** (push/PR/weekly) — pip-audit, CodeQL, and Trivy. Dependency and
-  filesystem scans report without blocking; CodeQL results upload to the Security
-  tab.
-
-The loop workflows (`e2e`, `retrain`, `monitor`, `cd`) validate pipeline
-mechanics on the synthetic profile; `quality` validates model quality on real
-data. Configuring the real datasets and a hosted MLflow server via secrets runs
-the identical code on production infrastructure.
-
-**Reproducible installs.** CI and the serving image install from fully-pinned
-lockfiles (`requirements.lock`, `requirements-api.lock`) so transitive versions
-can't drift between runs. Regenerate them after changing `pyproject.toml`:
-
-```powershell
-uv pip compile --python-platform linux --python-version 3.11 --extra dev -o requirements.lock pyproject.toml
-uv pip compile --python-platform linux --python-version 3.11 --extra api -o requirements-api.lock pyproject.toml
-```
-
-## Testing
-
-A hermetic test suite with an 80% coverage gate over **both** `src/` and `api/`,
-ruff-clean. It uses a synthetic
-fixture, so it requires no Kaggle credentials, network, or tracking server, while
-still exercising the full code paths (validation, preprocessing, XGBoost
-training, MLflow logging, the pyfunc wrapper, the async API, and drift logic).
-
-```powershell
-pytest tests/ -v --cov=src --cov=api --cov-fail-under=80
-ruff check src/ tests/ api/
-```
-
-## Modelling choices
-
-* **Split strategy** (`preprocess.split_strategy`): default `stratified` (random,
-  comparable to the published random-split benchmarks). An opt-in `temporal` mode
-  trains on the oldest transactions and tests on the newest — a stricter
-  evaluation that better reflects production. Measured on `creditcard`: AUPRC
-  drops 0.826 -> 0.773 and the fraud rate itself drifts across the window
-  (0.00184 train -> 0.00122 test), leaving only 52 test positives instead of 71.
-  **At that operating point the run does not clear the benchmark gate**
-  (recall 0.750 < 0.78, precision 0.488 < 0.60), so switching this on means
-  retuning the gate to temporal-appropriate targets — the honest cost of
-  evaluating on future data. Falls back to stratified when the profile has no
-  time column (cc-default).
-* **Decision threshold** is tuned on validation, not left at 0.5. Two strategies
-  (`train.threshold_strategy`): `recall` (highest precision above a recall floor)
-  or `cost` (minimise `cost_fn*FN + cost_fp*FP` — fraud's asymmetric error costs).
-* **Probability calibration** (`train.calibration`) — **available, defaults to
-  `none`.** Setting it to `isotonic` fits an isotonic map on validation to
-  correct the scores `scale_pos_weight` distorts and bundles it into the serving
-  model, so `/predict` returns a calibrated probability. It is *order*-preserving
-  but **not strictly** so: isotonic regression is a step function, and on this
-  data it collapses 42,149 distinct validation scores into 1,462 levels. Those
-  ties shift rank-based metrics slightly (measured: ROC-AUC 0.9794 -> 0.9856,
-  AUPRC 0.8720 -> 0.8716), so treat calibration as changing the *reported
-  probability*, not as a free no-op on the ranking metrics. The published metrics
-  below were produced with calibration **off**, the shipped default.
-
-## Limitations & future work
-
-* **Single-split benchmark gating is noisy** at this fraud count — measured at a
-  52% per-fold failure rate. [scripts/cv_evaluate.py](scripts/cv_evaluate.py)
-  implements CV-based gating (`--gate` fails on the fold mean); wiring it into CI
-  in place of the single-split gate is the remaining step.
-* Features arrive pre-PCA'd, which limits how narratable SHAP explanations are.
-* No online feature store — serving recomputes from the request payload only.
-
-## Stack
-
-Python 3.11 · DVC · Pandera · XGBoost · scikit-learn · MLflow · SHAP ·
-Evidently · FastAPI · Pydantic v2 · Docker · GitHub Actions · pytest · ruff · mypy
+MLOps pipeline base (DVC stages, validation, MLflow tracking, FastAPI serving,
+drift monitoring, CI) taken from
+**[neopentane7/mlops-fraud-detection](https://github.com/neopentane7/mlops-fraud-detection)**
+(MIT License, © 2026 Abhik Kumar Mohanta). Its original README, with detailed
+engineering notes, is kept in [docs/upstream_readme.md](docs/upstream_readme.md).
+Dataset: [ULB Machine Learning Group, Credit Card Fraud Detection](https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud).
 
 ## License
 
-Released under the [MIT License](LICENSE).
+[MIT](LICENSE). The original copyright notice is preserved.

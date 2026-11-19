@@ -54,8 +54,8 @@ flowchart TD
 
     subgraph PIPE["DVC pipeline (reproducible, cached)"]
         DL["download.py<br/>row-count gate"] --> VAL["validate.py<br/>Pandera gate (schema from config)"]
-        VAL --> PRE["preprocess.py<br/>dedup -> stratified split<br/>RobustScaler (fit on train)"]
-        PRE --> TR["train.py<br/>XGBoost + recall-first threshold"]
+        VAL --> PRE["preprocess.py<br/>dedup -> stratified split<br/>DuckDB SQL features<br/>RobustScaler (fit on train)"]
+        PRE --> TR["train.py<br/>4 models compared:<br/>XGBoost · LightGBM · RF · LogReg<br/>best by PR-AUC"]
         TR --> EV["evaluate.py<br/>benchmark + challenger gates"]
     end
 
@@ -92,12 +92,13 @@ Outputs are namespaced per dataset (`<name>` = active profile, e.g.
 flowchart LR
     A["download<br/><i>data/raw/&lt;file&gt;.csv</i>"] --> B["validate<br/><i>validated/&lt;name&gt;/report.json</i>"]
     B --> C["preprocess<br/><i>processed/&lt;name&gt;/*.parquet<br/>models/&lt;name&gt;/scaler.pkl</i>"]
-    C --> D["train<br/><i>models/&lt;name&gt;/threshold.json<br/>metrics/&lt;name&gt;/train_metrics.json</i>"]
+    C --> D["train<br/><i>models/&lt;name&gt;/threshold.json<br/>metrics/&lt;name&gt;/model_comparison.json</i>"]
     D --> E["evaluate<br/><i>metrics/&lt;name&gt;/eval_metrics.json</i>"]
+    E --> F["promote<br/><i>Staging -> Production</i>"]
 
     P[("params.yaml")] -.->|data.* (schema)| B
-    P -.->|preprocess.*| C
-    P -.->|train.* + per-dataset overrides| D
+    P -.->|preprocess.* + features.sql_features| C
+    P -.->|train.model_type/candidates + overrides| D
 ```
 
 ---
