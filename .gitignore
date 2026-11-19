@@ -56,3 +56,4 @@ implementation_history.md
 docs/concepts.md
 INTERVIEW_BRIEF.md
 HANDOFF.md
+.coverage.*
