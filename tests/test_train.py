@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import mlflow
@@ -11,6 +13,7 @@ import pytest
 
 from src.config import (
     FEATURE_COLUMNS,
+    MODEL_TYPES,
     TARGET_COLUMN,
     Config,
     MonitoringConfig,
@@ -211,6 +214,10 @@ def test_train_end_to_end(
         train_mod, "TRAIN_METRICS_PATH", tmp_path / "train_metrics.json"
     )
     monkeypatch.setattr(train_mod, "RUN_INFO_PATH", tmp_path / "run_info.json")
+    monkeypatch.setattr(train_mod, "TEST_PATH", processed_data["test"])
+    monkeypatch.setattr(
+        train_mod, "MODEL_COMPARISON_PATH", tmp_path / "model_comparison.json"
+    )
 
     run_id = train_mod.train(_tiny_config())
 
@@ -218,3 +225,55 @@ def test_train_end_to_end(
     assert (tmp_path / "threshold.json").exists()
     assert (tmp_path / "train_metrics.json").exists()
     assert (tmp_path / "run_info.json").exists()
+
+    # Every candidate family got its own run; the winner is the PR-AUC argmax
+    # and the served pointer (run_info.json) is the winner's run.
+    comparison = json.loads((tmp_path / "model_comparison.json").read_text())
+    assert set(comparison["models"]) == set(MODEL_TYPES)
+    best = max(
+        comparison["models"],
+        key=lambda m: comparison["models"][m]["val"]["avg_precision"],
+    )
+    assert comparison["best_model"] == best
+    assert comparison["models"][best]["run_id"] == run_id
+    assert all(m["test"] is not None for m in comparison["models"].values())
+    info = json.loads((tmp_path / "run_info.json").read_text())
+    assert info["run_id"] == run_id
+
+    # The registered pyfunc returns probabilities whatever the family.
+    model = mlflow.pyfunc.load_model(info["model_uri"])
+    frame = pd.read_parquet(processed_data["val"]).head(5)
+    probs = np.asarray(model.predict(frame[list(FEATURE_COLUMNS)]))
+    assert probs.shape == (5,) and ((probs >= 0) & (probs <= 1)).all()
+
+
+@pytest.mark.parametrize(
+    "model_type", ["xgboost", "lightgbm", "logreg", "random_forest"]
+)
+def test_build_model_each_family_fits(model_type: str, raw_df: pd.DataFrame) -> None:
+    """Each candidate family builds, fits and yields usable importances."""
+    model = build_model(_tiny_config().train, model_type)
+    x, y = raw_df[list(FEATURE_COLUMNS)], raw_df[TARGET_COLUMN]
+    model.fit(x, y)
+    probs = model.predict_proba(x)[:, 1]
+    assert probs.shape == (len(x),)
+    importance = train_mod.feature_importance_frame(model, list(FEATURE_COLUMNS))
+    assert len(importance) > 0
+
+
+def test_candidate_resolution_and_selection() -> None:
+    """auto -> all candidates; a single family -> just that one; argmax wins."""
+    cfg = _tiny_config().train
+    assert train_mod.candidate_model_types(cfg) == list(MODEL_TYPES)
+    single = replace(cfg, model_type="lightgbm")
+    assert train_mod.candidate_model_types(single) == ["lightgbm"]
+    assert train_mod.resolve_model_type(cfg) == "xgboost"
+    results = [
+        {"model_type": "a", "val": {"avg_precision": 0.5}},
+        {"model_type": "b", "val": {"avg_precision": 0.9}},
+    ]
+    assert train_mod.select_best(results, "avg_precision")["model_type"] == "b"
+    with pytest.raises(ValueError):
+        replace(cfg, model_type="svm")
+    with pytest.raises(ValueError):
+        build_model(cfg, "svm")

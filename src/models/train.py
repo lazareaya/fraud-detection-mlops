@@ -1,6 +1,10 @@
-"""DVC stage: train the XGBoost fraud model and track everything in MLflow.
+"""DVC stage: train and compare fraud models, track everything in MLflow.
 
-The most important file in the project. A single training run:
+The most important file in the project. With ``train.model_type: auto`` it
+trains **four model families** — XGBoost, LightGBM, random forest and logistic
+regression — each as its own (nested) MLflow run, then keeps the best one by
+validation **PR-AUC** (``selection_metric``) and registers it. Each candidate
+run:
 
 1. logs every hyperparameter and the tuned decision threshold,
 2. computes the full fraud-focused metric suite on the validation split
@@ -8,10 +12,11 @@ The most important file in the project. A single training run:
 3. generates and logs explainability + diagnostic plots (SHAP, confusion
    matrix, PR/ROC curves) and feature importances — SHAP artifacts are a
    regulatory expectation in real fintech pipelines,
-4. logs both the native XGBoost model and a probability-returning pyfunc
-   wrapper, and
-5. registers + promotes the model to ``Staging`` *only if* it clears the
-   performance gate.
+4. logs a probability-returning pyfunc wrapper (plus the native XGBoost
+   model for the XGBoost candidate).
+
+The parent run logs the comparison table/chart; the winner is registered and
+promoted to ``Staging`` *only if* it clears the performance gate.
 
 Run as a DVC stage; uses ``print`` for stage output.
 """
@@ -23,6 +28,7 @@ import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, TypeAlias
 
 import matplotlib
 
@@ -34,7 +40,10 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import shap  # noqa: E402
 import xgboost as xgb  # noqa: E402
+from lightgbm import LGBMClassifier  # noqa: E402
 from mlflow.exceptions import MlflowException  # noqa: E402
+from sklearn.ensemble import RandomForestClassifier  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
 from sklearn.metrics import (  # noqa: E402
     ConfusionMatrixDisplay,
     confusion_matrix,
@@ -44,9 +53,12 @@ from sklearn.metrics import (  # noqa: E402
 
 from src.config import (  # noqa: E402
     EXPERIMENT_NAME,
-    FEATURE_COLUMNS,
+    MODEL_COMPARISON_PATH,
+    MODEL_FEATURE_COLUMNS,
     REGISTERED_MODEL_NAME,
+    SQL_FEATURES_ENABLED,
     TARGET_COLUMN,
+    TEST_PATH,
     THRESHOLD_PATH,
     TRAIN_METRICS_PATH,
     TRAIN_OVERRIDES,
@@ -57,16 +69,21 @@ from src.config import (  # noqa: E402
     load_config,
 )
 from src.models.evaluate import RUN_INFO_PATH, compute_metrics
-from src.models.predict import (
+from src.models.predict import (  # noqa: E402
     CALIBRATOR_ARTIFACT_KEY,
+    SKLEARN_ARTIFACT_KEY,
     XGB_ARTIFACT_KEY,
     FraudProbaModel,
     apply_calibrator,
     classify,
     fit_calibrator,
     save_calibrator,
+    save_pickled_model,
     save_xgb_model,
 )
+
+# Any fitted sklearn-compatible classifier (XGBoost, LightGBM, RF, LogReg).
+Classifier: TypeAlias = Any
 
 SHAP_SAMPLE_SIZE = 500
 THRESHOLD_EPS = 1e-8
@@ -95,25 +112,81 @@ def apply_train_overrides(train_cfg: TrainConfig, y_train: pd.Series) -> TrainCo
     return replace(train_cfg, **overrides) if overrides else train_cfg
 
 
-def build_model(cfg: TrainConfig) -> xgb.XGBClassifier:
-    """Construct an XGBoost classifier configured for the imbalanced problem.
+def resolve_model_type(cfg: TrainConfig, model_type: str | None = None) -> str:
+    """Concrete model family for a single build (``auto`` defaults to XGBoost)."""
+    chosen = model_type or cfg.model_type
+    return "xgboost" if chosen == "auto" else chosen
 
-    ``scale_pos_weight`` (not oversampling) is used to make the loss function
-    weight the rare fraud class; ``aucpr`` is the eval metric because PR-AUC is
-    the right summary statistic under extreme class imbalance.
+
+def candidate_model_types(cfg: TrainConfig) -> list[str]:
+    """Model families to train: every candidate for ``auto``, else just one."""
+    return list(cfg.candidates) if cfg.model_type == "auto" else [cfg.model_type]
+
+
+def build_model(cfg: TrainConfig, model_type: str | None = None) -> Classifier:
+    """Construct one classifier configured for the imbalanced problem.
+
+    All four families handle the 577:1 imbalance through the *loss* rather than
+    resampling: ``scale_pos_weight`` for the boosters, ``class_weight`` for the
+    scikit-learn models. Boosters share the tuned depth / learning-rate /
+    subsampling hyperparameters so the comparison is like-for-like.
+
+    Args:
+        cfg: Training configuration.
+        model_type: Override ``cfg.model_type`` (``auto`` -> ``xgboost``).
     """
-    return xgb.XGBClassifier(
-        n_estimators=cfg.n_estimators,
-        max_depth=cfg.max_depth,
-        learning_rate=cfg.learning_rate,
-        scale_pos_weight=cfg.scale_pos_weight,
-        subsample=cfg.subsample,
-        colsample_bytree=cfg.colsample_bytree,
-        random_state=cfg.random_seed,
-        eval_metric="aucpr",
-        tree_method="hist",
-        n_jobs=-1,
-    )
+    kind = resolve_model_type(cfg, model_type)
+    if kind == "xgboost":
+        # ``aucpr`` eval metric: PR-AUC is the right summary under imbalance.
+        return xgb.XGBClassifier(
+            n_estimators=cfg.n_estimators,
+            max_depth=cfg.max_depth,
+            learning_rate=cfg.learning_rate,
+            scale_pos_weight=cfg.scale_pos_weight,
+            subsample=cfg.subsample,
+            colsample_bytree=cfg.colsample_bytree,
+            random_state=cfg.random_seed,
+            eval_metric="aucpr",
+            tree_method="hist",
+            n_jobs=-1,
+        )
+    if kind == "lightgbm":
+        # min_child_weight/reg_lambda are essential here: with LightGBM's
+        # default min_child_weight=1e-3, scale_pos_weight=24 at 577:1 lets
+        # near-empty leaves take extreme values and val PR-AUC collapses to
+        # ~0.2-0.3; with a hessian floor of 1 it is ~0.86 (measured).
+        return LGBMClassifier(
+            min_child_weight=1.0,
+            reg_lambda=1.0,
+            n_estimators=cfg.n_estimators,
+            max_depth=cfg.max_depth,
+            num_leaves=2**cfg.max_depth,
+            learning_rate=cfg.learning_rate,
+            scale_pos_weight=cfg.scale_pos_weight,
+            subsample=cfg.subsample,
+            subsample_freq=1,
+            colsample_bytree=cfg.colsample_bytree,
+            random_state=cfg.random_seed,
+            n_jobs=-1,
+            verbose=-1,
+        )
+    if kind == "random_forest":
+        return RandomForestClassifier(
+            n_estimators=300,
+            min_samples_leaf=2,
+            max_features="sqrt",
+            class_weight="balanced_subsample",
+            random_state=cfg.random_seed,
+            n_jobs=-1,
+        )
+    if kind == "logreg":
+        return LogisticRegression(
+            class_weight="balanced",
+            C=0.1,
+            max_iter=2000,
+            random_state=cfg.random_seed,
+        )
+    raise ValueError(f"Unknown model_type: {kind!r}")
 
 
 def _cost_optimal_threshold(
@@ -156,7 +229,7 @@ def _cost_optimal_threshold(
 
 
 def find_optimal_threshold(
-    model: xgb.XGBClassifier,
+    model: Classifier,
     x_val: pd.DataFrame,
     y_val: pd.Series,
     min_recall: float = 0.85,
@@ -261,13 +334,13 @@ def _save_roc_curve(y_true: pd.Series, probs: np.ndarray, out: Path) -> None:
     plt.close(fig)
 
 
-def _save_shap_summary(
-    model: xgb.XGBClassifier, x_val: pd.DataFrame, out: Path
-) -> None:
+def _save_shap_summary(model: Classifier, x_val: pd.DataFrame, out: Path) -> None:
     """Save a SHAP beeswarm summary plot on a validation sample."""
     sample = x_val.sample(n=min(SHAP_SAMPLE_SIZE, len(x_val)), random_state=0)
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(sample)
+    if isinstance(shap_values, list):  # some versions: one array per class
+        shap_values = shap_values[-1]
     plt.figure()
     shap.summary_plot(shap_values, sample, show=False)
     plt.tight_layout()
@@ -276,12 +349,13 @@ def _save_shap_summary(
 
 
 def log_plots(
-    model: xgb.XGBClassifier,
+    model: Classifier,
     x_val: pd.DataFrame,
     y_val: pd.Series,
     threshold: float,
     artifact_dir: Path,
     probs: np.ndarray,
+    with_shap: bool = True,
 ) -> None:
     """Generate all diagnostic plots into ``artifact_dir`` and log them.
 
@@ -306,42 +380,66 @@ def log_plots(
     # SHAP's TreeExplainer is brittle across shap/xgboost version combos; a
     # missing explainability *plot* must never abort a training run, so it is
     # best-effort and logged only if it succeeds.
-    try:
-        _save_shap_summary(model, x_val, shap_path)
-        artifacts.append(shap_path)
-    except Exception as exc:  # noqa: BLE001 - artifact generation is non-critical
-        print(f"[train] SHAP summary skipped ({type(exc).__name__}: {exc})")
+    # Only for the gradient-boosted candidates: exact TreeExplainer on a deep
+    # random forest is slow, and it does not apply to the linear model.
+    if with_shap:
+        try:
+            _save_shap_summary(model, x_val, shap_path)
+            artifacts.append(shap_path)
+        except Exception as exc:  # noqa: BLE001 - artifact generation is non-critical
+            print(f"[train] SHAP summary skipped ({type(exc).__name__}: {exc})")
 
     for path in artifacts:
         mlflow.log_artifact(str(path))
 
 
-def _log_feature_importance(model: xgb.XGBClassifier, artifact_dir: Path) -> None:
-    """Write gain-based feature importances to CSV and log them."""
-    booster = model.get_booster()
-    gain = booster.get_score(importance_type="gain")
-    frame = (
-        pd.DataFrame({"feature": list(gain.keys()), "gain": list(gain.values())})
-        .sort_values("gain", ascending=False)
+def feature_importance_frame(model: Classifier, features: list[str]) -> pd.DataFrame:
+    """Importance per feature for any candidate family.
+
+    XGBoost: total gain; LightGBM / random forest: ``feature_importances_``;
+    logistic regression: absolute coefficient (features are scaled).
+    """
+    if isinstance(model, xgb.XGBClassifier):
+        gain = model.get_booster().get_score(importance_type="gain")
+        names, values = list(gain.keys()), list(gain.values())
+    elif hasattr(model, "feature_importances_"):
+        names, values = features, list(np.asarray(model.feature_importances_))
+    elif hasattr(model, "coef_"):
+        names, values = features, list(np.abs(np.asarray(model.coef_)[0]))
+    else:
+        names, values = [], []
+    return (
+        pd.DataFrame({"feature": names, "importance": values})
+        .sort_values("importance", ascending=False)
         .reset_index(drop=True)
     )
+
+
+def _log_feature_importance(
+    model: Classifier, artifact_dir: Path, features: list[str] | None = None
+) -> None:
+    """Write feature importances to CSV and log them."""
+    frame = feature_importance_frame(model, features or list(MODEL_FEATURE_COLUMNS))
     path = artifact_dir / "feature_importance.csv"
     frame.to_csv(path, index=False)
     mlflow.log_artifact(str(path))
 
 
 def _log_models(
-    model: xgb.XGBClassifier, artifact_dir: Path, calibrator_path: Path | None = None
+    model: Classifier, artifact_dir: Path, calibrator_path: Path | None = None
 ) -> None:
-    """Log the native XGBoost model and a probability pyfunc wrapper.
+    """Log a probability pyfunc wrapper (plus the native model for XGBoost).
 
     When a calibrator is provided it is bundled into the pyfunc so serving
     returns calibrated probabilities transparently.
     """
-    mlflow.xgboost.log_model(model, artifact_path="model_native")
-
-    xgb_path = save_xgb_model(model, artifact_dir / "xgb_model.json")
-    artifacts = {XGB_ARTIFACT_KEY: str(xgb_path)}
+    if isinstance(model, xgb.XGBClassifier):
+        mlflow.xgboost.log_model(model, artifact_path="model_native")
+        xgb_path = save_xgb_model(model, artifact_dir / "xgb_model.json")
+        artifacts = {XGB_ARTIFACT_KEY: str(xgb_path)}
+    else:
+        pkl_path = save_pickled_model(model, artifact_dir / "model.pkl")
+        artifacts = {SKLEARN_ARTIFACT_KEY: str(pkl_path)}
     if calibrator_path is not None:
         artifacts[CALIBRATOR_ARTIFACT_KEY] = str(calibrator_path)
     mlflow.pyfunc.log_model(
@@ -391,29 +489,40 @@ def _persist_outputs(run_id: str, threshold: float) -> None:
     mlflow.log_artifact(str(THRESHOLD_PATH))
 
 
-def train(cfg: Config) -> str:
-    """Train, evaluate, log, and conditionally promote the model.
+def load_test() -> pd.DataFrame | None:
+    """Holdout split, if present (reported per candidate, never used to select)."""
+    return pd.read_parquet(TEST_PATH) if Path(TEST_PATH).exists() else None
+
+
+def train_candidate(
+    model_type: str,
+    train_cfg: TrainConfig,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    x_val: pd.DataFrame,
+    y_val: pd.Series,
+    test_df: pd.DataFrame | None = None,
+) -> dict[str, Any]:
+    """Train + log ONE model family inside the currently active MLflow run.
 
     Returns:
-        The MLflow run id of the completed training run.
+        ``{"model_type", "run_id", "threshold", "val": metrics,
+        "test": metrics | None}``.
     """
-    train_df, val_df = load_data()
-    x_train, y_train = train_df[list(FEATURE_COLUMNS)], train_df[TARGET_COLUMN]
-    x_val, y_val = val_df[list(FEATURE_COLUMNS)], val_df[TARGET_COLUMN]
-
-    mlflow.set_experiment(EXPERIMENT_NAME)
-    with mlflow.start_run() as run, tempfile.TemporaryDirectory() as tmp:
-        run_id = str(run.info.run_id)
+    run = mlflow.active_run()
+    assert run is not None, "train_candidate must run inside an MLflow run"
+    run_id = str(run.info.run_id)
+    features = list(x_train.columns)
+    with tempfile.TemporaryDirectory() as tmp:
         artifact_dir = Path(tmp)
-
-        train_cfg = apply_train_overrides(cfg.train, y_train)
-        model = build_model(train_cfg)
+        model = build_model(train_cfg, model_type)
         model.fit(x_train, y_train)
 
         # Optional probability calibration fit on validation. Threshold and
         # logged metrics use the *calibrated* scores so they match what serving
         # produces (the calibrator is bundled into the pyfunc below).
         raw_val = model.predict_proba(x_val)[:, 1]
+        calibrator = None
         calibrator_path: Path | None = None
         if train_cfg.calibration != "none":
             calibrator = fit_calibrator(
@@ -438,28 +547,179 @@ def train(cfg: Config) -> str:
         )
         metrics = compute_metrics(y_val, probs, threshold)
 
+        # Holdout metrics are *reported* for the comparison table only — the
+        # winner is chosen on validation, so the test split stays untouched by
+        # model selection.
+        test_metrics: dict[str, float] | None = None
+        if test_df is not None:
+            test_probs = model.predict_proba(test_df[features])[:, 1]
+            if calibrator is not None:
+                test_probs = apply_calibrator(calibrator, test_probs)
+            test_metrics = compute_metrics(
+                test_df[TARGET_COLUMN], test_probs, threshold
+            )
+
+        mlflow.set_tags(
+            {
+                "model_type": model_type,
+                "feature_set": "sql" if SQL_FEATURES_ENABLED else "base",
+            }
+        )
         mlflow.log_params(train_cfg.__dict__)
+        mlflow.log_param("model_family", model_type)
+        mlflow.log_param("n_features", len(features))
         mlflow.log_param("threshold", threshold)
         mlflow.log_metrics({k: v for k, v in metrics.items() if k != "threshold"})
+        if test_metrics:
+            mlflow.log_metrics(
+                {f"test_{k}": v for k, v in test_metrics.items() if k != "threshold"}
+            )
 
-        log_plots(model, x_val, y_val, threshold, artifact_dir, probs)
-        _log_feature_importance(model, artifact_dir)
+        log_plots(
+            model,
+            x_val,
+            y_val,
+            threshold,
+            artifact_dir,
+            probs,
+            with_shap=model_type in {"xgboost", "lightgbm"},
+        )
+        _log_feature_importance(model, artifact_dir, features)
         _log_models(model, artifact_dir, calibrator_path)
+
+    print(
+        f"[train] {model_type:<14} val PR-AUC={metrics['avg_precision']:.4f} "
+        f"recall={metrics['recall_fraud']:.4f} "
+        f"precision={metrics['precision_fraud']:.4f}"
+    )
+    return {
+        "model_type": model_type,
+        "run_id": run_id,
+        "threshold": threshold,
+        "val": metrics,
+        "test": test_metrics,
+    }
+
+
+def select_best(results: list[dict[str, Any]], metric: str) -> dict[str, Any]:
+    """Winner = highest validation ``metric`` (ties -> first candidate)."""
+    return max(results, key=lambda r: float(r["val"][metric]))
+
+
+def _save_comparison_chart(
+    results: list[dict[str, Any]], metric: str, out: Path
+) -> None:
+    """Bar chart of validation PR-AUC / recall / precision per model family."""
+    names = [r["model_type"] for r in results]
+    keys = [
+        (metric, "PR-AUC"),
+        ("recall_fraud", "Recall"),
+        ("precision_fraud", "Precision"),
+    ]
+    x = np.arange(len(names))
+    width = 0.26
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for i, (key, label) in enumerate(keys):
+        values = [r["val"][key] for r in results]
+        ax.bar(x + (i - 1) * width, values, width, label=label)
+    ax.set_xticks(x, names)
+    ax.set_ylim(0, 1)
+    ax.set_title("Model comparison (validation)")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(out, dpi=120)
+    plt.close(fig)
+
+
+def _comparison_payload(
+    results: list[dict[str, Any]], best: dict[str, Any], metric: str
+) -> dict[str, Any]:
+    """JSON-serialisable comparison summary (DVC metric + README source)."""
+    return {
+        "feature_set": "sql" if SQL_FEATURES_ENABLED else "base",
+        "selection_metric": metric,
+        "best_model": best["model_type"],
+        "best_run_id": best["run_id"],
+        "models": {
+            r["model_type"]: {
+                "run_id": r["run_id"],
+                "threshold": r["threshold"],
+                "val": r["val"],
+                "test": r["test"],
+            }
+            for r in results
+        },
+    }
+
+
+def train(cfg: Config) -> str:
+    """Train every candidate family, keep the best by PR-AUC, register it.
+
+    Returns:
+        The MLflow run id of the winning candidate's run.
+    """
+    train_df, val_df = load_data()
+    features = [c for c in MODEL_FEATURE_COLUMNS if c in train_df.columns]
+    x_train, y_train = train_df[features], train_df[TARGET_COLUMN]
+    x_val, y_val = val_df[features], val_df[TARGET_COLUMN]
+    test_df = load_test()
+
+    train_cfg = apply_train_overrides(cfg.train, y_train)
+    metric = train_cfg.selection_metric
+    model_types = candidate_model_types(train_cfg)
+
+    mlflow.set_experiment(EXPERIMENT_NAME)
+    feature_set = "sql" if SQL_FEATURES_ENABLED else "base"
+    with mlflow.start_run(run_name=f"comparison-{feature_set}") as parent:
+        mlflow.set_tags({"stage": "model-comparison", "feature_set": feature_set})
+        results: list[dict[str, Any]] = []
+        for model_type in model_types:
+            with mlflow.start_run(run_name=model_type, nested=True):
+                results.append(
+                    train_candidate(
+                        model_type, train_cfg, x_train, y_train, x_val, y_val, test_df
+                    )
+                )
+
+        best = select_best(results, metric)
+        comparison = _comparison_payload(results, best, metric)
+        mlflow.log_param("best_model", best["model_type"])
+        mlflow.log_param("candidates", ",".join(model_types))
+        mlflow.log_metric(f"best_{metric}", float(best["val"][metric]))
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = Path(tmp) / "model_comparison.png"
+            _save_comparison_chart(results, metric, chart)
+            mlflow.log_artifact(str(chart))
+            table = Path(tmp) / "model_comparison.json"
+            table.write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+            mlflow.log_artifact(str(table))
+        print(
+            f"[train] best model = {best['model_type']} "
+            f"({metric}={best['val'][metric]:.4f}, parent run {parent.info.run_id})"
+        )
+
+    # Outputs point at the WINNER's run (its pyfunc is what gets served).
+    run_id = str(best["run_id"])
+    threshold = float(best["threshold"])
+    metrics = {**best["val"], "model_type": best["model_type"]}
+    with mlflow.start_run(run_id=run_id):
         _persist_outputs(run_id, threshold)
 
-        TRAIN_METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TRAIN_METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    TRAIN_METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TRAIN_METRICS_PATH.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    MODEL_COMPARISON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MODEL_COMPARISON_PATH.write_text(json.dumps(comparison, indent=2), encoding="utf-8")
 
-        # Staging-promotion floor: per-dataset override (train_overrides) or the
-        # global default — keeps the bar consistent with each dataset's gate.
-        promotion_floor = float(
-            TRAIN_OVERRIDES.get(
-                "performance_threshold", cfg.monitoring.performance_threshold
-            )
+    # Staging-promotion floor: per-dataset override (train_overrides) or the
+    # global default — keeps the bar consistent with each dataset's gate.
+    promotion_floor = float(
+        TRAIN_OVERRIDES.get(
+            "performance_threshold", cfg.monitoring.performance_threshold
         )
-        print(f"[train] run_id={run_id} metrics={metrics}")
-        maybe_promote_to_staging(run_id, metrics["f1_fraud"], promotion_floor)
-        return run_id
+    )
+    print(f"[train] run_id={run_id} metrics={metrics}")
+    maybe_promote_to_staging(run_id, float(best["val"]["f1_fraud"]), promotion_floor)
+    return run_id
 
 
 def main() -> int:

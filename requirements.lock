@@ -132,6 +132,8 @@ docker==7.1.0
     # via mlflow
 dpath==2.2.0
     # via dvc
+duckdb==2.0.0
+    # via fraud-detection-mlops (pyproject.toml)
 dulwich==1.2.6
     # via
     #   dvc
@@ -298,6 +300,8 @@ kombu==5.6.2
     #   celery
     #   dvc
     #   dvc-task
+lightgbm==4.7.0
+    # via fraud-detection-mlops (pyproject.toml)
 litestar==2.24.0
     # via evidently
 litestar-htmx==0.5.0
@@ -344,7 +348,9 @@ mypy-extensions==1.1.0
     #   mypy
     #   typing-inspect
 narwhals==2.22.1
-    # via plotly
+    # via
+    #   lightgbm
+    #   plotly
 networkx==3.6.1
     # via dvc
 nltk==3.9.4
@@ -358,6 +364,7 @@ numpy==1.26.4
     #   fraud-detection-mlops (pyproject.toml)
     #   contourpy
     #   evidently
+    #   lightgbm
     #   matplotlib
     #   mlflow
     #   numba
@@ -591,6 +598,7 @@ scikit-learn==1.5.2
 scipy==1.17.1
     # via
     #   evidently
+    #   lightgbm
     #   mlflow
     #   scikit-learn
     #   shap

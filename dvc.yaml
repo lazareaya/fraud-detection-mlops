@@ -21,6 +21,7 @@ stages:
     cmd: python src/data/preprocess.py
     deps:
       - src/data/preprocess.py
+      - src/data/features.py
       - data/raw/creditcard.csv
       - data/validated/creditcard/validation_report.json
     params:
@@ -29,12 +30,14 @@ stages:
       - preprocess.random_seed
       - preprocess.split_strategy
       - preprocess.time_column
+      - features.sql_features
     outs:
       - data/processed/creditcard/train.parquet
       - data/processed/creditcard/val.parquet
       - data/processed/creditcard/test.parquet
       - data/processed/creditcard/reference.parquet
       - models/creditcard/scaler.pkl
+      - models/creditcard/hourly_amount_stats.json
 
   train:
     cmd: python src/models/train.py
@@ -43,7 +46,12 @@ stages:
       - src/models/evaluate.py
       - data/processed/creditcard/train.parquet
       - data/processed/creditcard/val.parquet
+      - data/processed/creditcard/test.parquet
     params:
+      - features.sql_features
+      - train.model_type
+      - train.candidates
+      - train.selection_metric
       - train.n_estimators
       - train.max_depth
       - train.learning_rate
@@ -59,6 +67,8 @@ stages:
     metrics:
       - metrics/creditcard/train_metrics.json:
           cache: false
+      - metrics/creditcard/model_comparison.json:
+          cache: false
     outs:
       - models/creditcard/threshold.json
 
@@ -71,3 +81,11 @@ stages:
     metrics:
       - metrics/creditcard/eval_metrics.json:
           cache: false
+
+  promote:
+    # The comparison winner, once it has passed the holdout gates, goes to
+    # Production in the MLflow registry (the API serves models:/.../Production).
+    cmd: python scripts/promote_model.py --promote staging-to-prod
+    deps:
+      - scripts/promote_model.py
+      - metrics/creditcard/eval_metrics.json

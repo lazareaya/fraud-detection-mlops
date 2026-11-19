@@ -4,9 +4,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# curl is needed by the container HEALTHCHECK below.
+# curl is needed by the container HEALTHCHECK below; libgomp1 by LightGBM.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned serving deps first (cached layer; the training stack is excluded).
@@ -26,6 +26,7 @@ COPY params.yaml ./params.yaml
 ARG DATASET=creditcard
 COPY models/${DATASET}/threshold.json ./models/${DATASET}/threshold.json
 COPY models/${DATASET}/scaler.pkl ./models/${DATASET}/scaler.pkl
+COPY models/${DATASET}/hourly_amount_stats.json ./models/${DATASET}/hourly_amount_stats.json
 
 ENV PYTHONPATH=/app
 ENV MLFLOW_TRACKING_URI=http://mlflow:5000

@@ -7,6 +7,11 @@ returns ``P(Class=1)``. Logging this wrapper means the FastAPI app can call
 ``mlflow.pyfunc.load_model("models:/fraud-detector/Production")`` generically
 and always get probabilities, with the decision threshold applied separately
 from the persisted ``threshold.json``.
+
+The wrapper is model-agnostic: XGBoost is stored in its native JSON format,
+while the other comparison candidates (LightGBM, random forest, logistic
+regression) are pickled scikit-learn estimators. Either way ``predict`` returns
+``P(Class=1)``, so the API never needs to know which family won.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from __future__ import annotations
 import json
 import pickle
 from pathlib import Path
+from typing import Any, TypeAlias
 
 import mlflow
 import numpy as np
@@ -23,7 +29,11 @@ from sklearn.isotonic import IsotonicRegression
 
 from src.config import FEATURE_COLUMNS, THRESHOLD_PATH
 
+# Any fitted sklearn-compatible classifier (untyped third-party objects).
+Classifier: TypeAlias = Any
+
 XGB_ARTIFACT_KEY = "xgb_model"
+SKLEARN_ARTIFACT_KEY = "sk_model"
 CALIBRATOR_ARTIFACT_KEY = "calibrator"
 
 
@@ -64,13 +74,28 @@ def load_threshold(path: Path = THRESHOLD_PATH) -> float:
     return float(json.loads(path.read_text(encoding="utf-8"))["threshold"])
 
 
+def model_feature_names(model: Classifier) -> list[str]:
+    """Feature names a fitted model was trained on (falls back to the schema)."""
+    try:
+        names = getattr(model, "feature_names_in_", None)
+    except (AttributeError, ValueError):  # unfitted / booster without names
+        names = None
+    return [str(n) for n in names] if names is not None else list(FEATURE_COLUMNS)
+
+
 class FraudProbaModel(mlflow.pyfunc.PythonModel):
-    """Pyfunc wrapper returning fraud probabilities from an XGBoost model."""
+    """Pyfunc wrapper returning fraud probabilities from any fitted classifier."""
 
     def load_context(self, context: mlflow.pyfunc.PythonModelContext) -> None:
-        """Load the XGBoost classifier and (optionally) the calibrator."""
-        self._model = xgb.XGBClassifier()
-        self._model.load_model(context.artifacts[XGB_ARTIFACT_KEY])
+        """Load the classifier (XGBoost JSON or pickled sklearn estimator)."""
+        self._model: Classifier
+        if XGB_ARTIFACT_KEY in context.artifacts:
+            self._model = xgb.XGBClassifier()
+            self._model.load_model(context.artifacts[XGB_ARTIFACT_KEY])
+        else:
+            with open(context.artifacts[SKLEARN_ARTIFACT_KEY], "rb") as handle:
+                self._model = pickle.load(handle)
+        self._features = model_feature_names(self._model)
         cal_path = context.artifacts.get(CALIBRATOR_ARTIFACT_KEY)
         if cal_path:
             with open(cal_path, "rb") as handle:
@@ -92,29 +117,40 @@ class FraudProbaModel(mlflow.pyfunc.PythonModel):
         Returns:
             1-D array of fraud probabilities in ``[0, 1]``.
         """
-        frame = ensure_feature_order(model_input)
+        frame = ensure_feature_order(model_input, self._features)
         probs = np.asarray(self._model.predict_proba(frame)[:, 1])
         if self._calibrator is not None:
             probs = apply_calibrator(self._calibrator, probs)
         return probs
 
 
-def ensure_feature_order(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return ``frame`` reordered/subset to the canonical feature columns.
+def ensure_feature_order(
+    frame: pd.DataFrame, columns: list[str] | tuple[str, ...] | None = None
+) -> pd.DataFrame:
+    """Return ``frame`` reordered/subset to ``columns`` (default: raw schema).
 
     Raises:
         KeyError: If any required feature column is missing.
     """
-    missing = [col for col in FEATURE_COLUMNS if col not in frame.columns]
+    cols = list(FEATURE_COLUMNS if columns is None else columns)
+    missing = [col for col in cols if col not in frame.columns]
     if missing:
         raise KeyError(f"Input is missing required feature columns: {missing}")
-    return frame[list(FEATURE_COLUMNS)]
+    return frame[cols]
 
 
 def save_xgb_model(model: xgb.XGBClassifier, path: Path) -> Path:
     """Persist an XGBoost classifier to the native JSON format."""
     path.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(str(path))
+    return path
+
+
+def save_pickled_model(model: Classifier, path: Path) -> Path:
+    """Pickle a fitted scikit-learn-compatible estimator to ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        pickle.dump(model, handle)
     return path
 
 

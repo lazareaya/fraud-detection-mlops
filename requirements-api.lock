@@ -20,6 +20,8 @@ click==8.4.2
     #   uvicorn
 cloudpickle==3.1.2
     # via mlflow-skinny
+duckdb==2.0.0
+    # via fraud-detection-mlops (pyproject.toml)
 entrypoints==0.4
     # via mlflow-skinny
 fastapi==0.139.0
@@ -42,11 +44,16 @@ importlib-metadata==7.2.1
     # via mlflow-skinny
 joblib==1.5.3
     # via scikit-learn
+lightgbm==4.7.0
+    # via fraud-detection-mlops (pyproject.toml)
 mlflow-skinny==2.13.2
     # via fraud-detection-mlops (pyproject.toml)
+narwhals==2.29.0
+    # via lightgbm
 numpy==1.26.4
     # via
     #   fraud-detection-mlops (pyproject.toml)
+    #   lightgbm
     #   pandas
     #   scikit-learn
     #   scipy
@@ -95,6 +102,7 @@ scikit-learn==1.5.2
     # via fraud-detection-mlops (pyproject.toml)
 scipy==1.17.1
     # via
+    #   lightgbm
     #   scikit-learn
     #   xgboost
 setuptools==80.10.2
