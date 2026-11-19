@@ -100,7 +100,20 @@ preprocess:
   split_strategy: stratified
   time_column: Time
 
+# Behavioural features computed in SQL with DuckDB (src/data/features.py):
+# hour_of_day, log_amount, amount_vs_hour_mean (window function). Override per
+# run with MLOPS_SQL_FEATURES=0/1 (used by scripts/compare_feature_sets.py).
+features:
+  sql_features: true
+
 train:
+  # Model family: xgboost | lightgbm | logreg | random_forest | auto.
+  # "auto" trains every family in `candidates` (one MLflow run each) and keeps
+  # the best one by `selection_metric` on validation — that model is the one
+  # registered and promoted.
+  model_type: auto
+  candidates: [xgboost, lightgbm, logreg, random_forest]
+  selection_metric: avg_precision   # PR-AUC, the right metric under 577:1 imbalance
   # Values tuned via 5-fold x 5-seed stratified CV on the real (deduplicated)
   # dataset; reproduce with scripts/cv_evaluate.py (metrics/<ds>/cv_metrics.json).
   # Shallower trees + more estimators generalise better than the naive

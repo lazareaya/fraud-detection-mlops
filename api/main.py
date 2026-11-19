@@ -51,7 +51,14 @@ from api.schemas import (
     PredictionResponse,
     TransactionFeatures,
 )
-from src.config import FEATURE_COLUMNS, SCALED_COLUMNS, SCALER_PATH
+from src.config import (
+    FEATURE_COLUMNS,
+    HOURLY_STATS_PATH,
+    MODEL_FEATURE_COLUMNS,
+    MODEL_SCALED_COLUMNS,
+    SCALER_PATH,
+    SQL_FEATURES_ENABLED,
+)
 from src.models.predict import load_threshold
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
@@ -64,7 +71,30 @@ Scaler: TypeAlias = Any  # fitted sklearn transformer (untyped third-party objec
 CallNext: TypeAlias = Callable[[Request], Awaitable[Response]]
 
 # --- Mutable serving state populated at startup -----------------------------
-STATE: dict[str, Any] = {"model": None, "threshold": None, "scaler": None, "info": {}}
+STATE: dict[str, Any] = {
+    "model": None,
+    "threshold": None,
+    "scaler": None,
+    "hourly_stats": None,
+    "info": {},
+}
+
+
+def _load_hourly_stats(path: Path = HOURLY_STATS_PATH) -> dict[str, Any] | None:
+    """Load the train-split hourly means the SQL features are computed against.
+
+    Like the scaler, a missing file is a startup failure when SQL features are
+    enabled: scoring without them would feed the model a different feature
+    vector than it was trained on.
+    """
+    if not SQL_FEATURES_ENABLED:
+        return None
+    from src.data.features import load_hourly_stats
+
+    try:
+        return load_hourly_stats(path)
+    except Exception as exc:  # noqa: BLE001 - any failure here must degrade
+        raise RuntimeError(f"SQL feature stats unavailable at {path}: {exc}") from exc
 
 
 def _load_scaler(path: Path = SCALER_PATH) -> Scaler | None:
@@ -84,14 +114,14 @@ def _load_scaler(path: Path = SCALER_PATH) -> Scaler | None:
         RuntimeError: If the profile has scaled columns but the scaler cannot
             be loaded (caught by :func:`lifespan`, which then serves degraded).
     """
-    if not SCALED_COLUMNS:
+    if not MODEL_SCALED_COLUMNS:
         return None
     try:
         with path.open("rb") as handle:
             return pickle.load(handle)
     except Exception as exc:  # noqa: BLE001 - any failure here must degrade
         raise RuntimeError(
-            f"Scaler required for scaled columns {list(SCALED_COLUMNS)} but "
+            f"Scaler required for scaled columns {list(MODEL_SCALED_COLUMNS)} but "
             f"could not be loaded from {path}: {exc}"
         ) from exc
 
@@ -120,10 +150,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             version = _resolve_version(model_name, model_stage)
         threshold = load_threshold()
         scaler = _load_scaler()
+        hourly_stats = _load_hourly_stats()
 
         STATE["model"] = model
         STATE["threshold"] = threshold
         STATE["scaler"] = scaler
+        STATE["hourly_stats"] = hourly_stats
         STATE["info"] = {"name": model_name, "stage": model_stage, "version": version}
         logger.info(
             "Loaded model %s (v%s)", model_uri or f"{model_name}/{model_stage}", version
@@ -133,11 +165,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         STATE["model"] = None
         STATE["threshold"] = None
         STATE["scaler"] = None
+        STATE["hourly_stats"] = None
         STATE["info"] = {"name": model_name, "stage": model_stage, "version": "unknown"}
     yield
     STATE["model"] = None
     STATE["threshold"] = None
     STATE["scaler"] = None
+    STATE["hourly_stats"] = None
 
 
 def _resolve_version(model_name: str, model_stage: str) -> str:
@@ -304,14 +338,24 @@ def _score_frame(
 ) -> list[dict[str, Any]]:
     """Score a feature frame, returning one result dict per row.
 
-    Raw ``Time``/``Amount`` from the request are transformed with the fitted
-    training scaler before scoring so the model sees inputs in the same space
-    it was trained on (no train/serve skew).
+    The SQL features (if enabled) are computed from the raw ``Time``/``Amount``
+    with the same DuckDB code as training, against the train-split hourly
+    means; then every scaled column goes through the fitted training scaler, so
+    the model sees inputs in the same space it was trained on (no skew).
     """
     ordered = frame[list(FEATURE_COLUMNS)].copy()
+    if SQL_FEATURES_ENABLED:
+        from src.data.features import add_sql_features
+
+        stats = STATE.get("hourly_stats")
+        if stats is None:
+            raise HTTPException(status_code=503, detail="Feature stats not loaded")
+        ordered = add_sql_features(ordered, stats)
+    ordered = ordered[list(MODEL_FEATURE_COLUMNS)]
     scaler = STATE.get("scaler")
     if scaler is not None:
-        ordered[list(SCALED_COLUMNS)] = scaler.transform(ordered[list(SCALED_COLUMNS)])
+        cols = list(MODEL_SCALED_COLUMNS)
+        ordered[cols] = scaler.transform(ordered[cols])
     probs = [float(p) for p in model.predict(ordered)]
     version = STATE["info"].get("version", "unknown")
     results: list[dict[str, Any]] = []

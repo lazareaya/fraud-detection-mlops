@@ -18,6 +18,10 @@ import os
 # benchmark targets and its Kaggle/OpenML source settings. Assigned rather than
 # setdefault-ed, so an ambient value cannot leak in.
 os.environ["MLOPS_DATASET"] = "creditcard"
+# Same reasoning for the SQL features: the suite pins the raw 30-feature schema
+# so every pre-existing test stays hermetic; tests/test_features.py exercises
+# the DuckDB feature code (and its serving path) explicitly.
+os.environ["MLOPS_SQL_FEATURES"] = "0"
 
 from pathlib import Path  # noqa: E402
 

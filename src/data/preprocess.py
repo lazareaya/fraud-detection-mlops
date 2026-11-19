@@ -10,6 +10,10 @@ Design decisions:
   to prevent data leakage; the fitted scaler is persisted for serving parity.
 * Splits are stratified on the target so the 577:1 imbalance is preserved in
   every split.
+* Optional **SQL features** (DuckDB, see :mod:`src.data.features`) are computed
+  on the *raw* Time/Amount right after the split — window function on train,
+  train-learned hourly means joined onto val/test — and then scaled with the
+  other numeric columns. The hourly means are persisted for the API.
 * A 20% stratified sample of the training split is saved as the drift
   ``reference`` baseline used later by the monitoring stage.
 
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import pickle
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -27,13 +32,21 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
 
 from src.config import (
+    HOURLY_STATS_PATH,
+    MODEL_SCALED_COLUMNS,
     PROCESSED_DIR,
     RAW_DATA_PATH,
     SCALED_COLUMNS,
     SCALER_PATH,
+    SQL_FEATURES_ENABLED,
     TARGET_COLUMN,
     PreprocessConfig,
     load_config,
+)
+from src.data.features import (
+    add_sql_features,
+    fit_hourly_stats,
+    save_hourly_stats,
 )
 
 REFERENCE_SAMPLE_FRAC = 0.20
@@ -103,15 +116,18 @@ def split_data(
 
 
 def scale_features(
-    train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+    test: pd.DataFrame,
+    columns: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, RobustScaler]:
-    """Fit a RobustScaler on train's Time/Amount and apply to all splits.
+    """Fit a RobustScaler on train's scaled columns and apply to all splits.
 
     Returns:
         The transformed copies of each split plus the fitted scaler.
     """
     scaler = RobustScaler()
-    cols = list(SCALED_COLUMNS)
+    cols = list(SCALED_COLUMNS if columns is None else columns)
 
     train, val, test = train.copy(), val.copy(), test.copy()
     train[cols] = scaler.fit_transform(train[cols])
@@ -152,7 +168,21 @@ def preprocess(
         print(f"[preprocess] dropped {n_removed} duplicate rows ({pct:.3%})")
 
     train, val, test = split_data(df, cfg)
-    train, val, test, scaler = scale_features(train, val, test)
+
+    # SQL feature engineering on the raw (unscaled) values. The hourly means
+    # are always written (a stub when disabled) so the DVC output exists.
+    hourly_stats: dict[str, object] = {"enabled": False}
+    if SQL_FEATURES_ENABLED:
+        train = add_sql_features(train)  # AVG() OVER (PARTITION BY hour)
+        hourly_stats = {"enabled": True, **fit_hourly_stats(train)}
+        val = add_sql_features(val, hourly_stats)
+        test = add_sql_features(test, hourly_stats)
+        print("[preprocess] added DuckDB SQL features (hour, log amount, hourly dev)")
+    save_hourly_stats(hourly_stats, scaler_path.parent / HOURLY_STATS_PATH.name)
+
+    train, val, test, scaler = scale_features(
+        train, val, test, columns=MODEL_SCALED_COLUMNS
+    )
 
     # Drift reference: a stratified sample of the (scaled) training data.
     reference = train.groupby(TARGET_COLUMN, group_keys=False).sample(

@@ -185,6 +185,46 @@ TRAIN_METRICS_PATH: Path = METRICS_DIR / "train_metrics.json"
 EVAL_METRICS_PATH: Path = METRICS_DIR / "eval_metrics.json"
 
 MONITORING_REPORTS_DIR: Path = PROJECT_ROOT / "monitoring" / "reports" / ACTIVE_DATASET
+MODEL_COMPARISON_PATH: Path = METRICS_DIR / "model_comparison.json"
+
+
+# --- SQL feature engineering (DuckDB, see src/data/features.py) -------------
+_TRUTHY = {"1", "true", "yes", "on"}
+# Must match src.data.features.SQL_FEATURE_COLUMNS / SQL_FEATURE_INPUTS (kept
+# literal here so config.py stays importable without duckdb).
+_SQL_FEATURES: tuple[str, ...] = ("hour_of_day", "log_amount", "amount_vs_hour_mean")
+_SQL_FEATURE_INPUTS: tuple[str, ...] = ("Time", "Amount")
+
+
+def _sql_features_enabled() -> bool:
+    """Whether the DuckDB SQL features are on for the active dataset.
+
+    ``$MLOPS_SQL_FEATURES`` (``1``/``0``) overrides ``features.sql_features`` in
+    params.yaml. Always off for profiles without raw ``Time``/``Amount``.
+    """
+    env = os.getenv("MLOPS_SQL_FEATURES")
+    if env is not None:
+        enabled = env.strip().lower() in _TRUTHY
+    else:
+        raw: dict[str, Any] = {}
+        if PARAMS_PATH.exists():
+            raw = yaml.safe_load(PARAMS_PATH.read_text(encoding="utf-8")) or {}
+        enabled = bool((raw.get("features") or {}).get("sql_features", False))
+    return enabled and all(c in FEATURE_COLUMNS for c in _SQL_FEATURE_INPUTS)
+
+
+SQL_FEATURES_ENABLED: bool = _sql_features_enabled()
+SQL_FEATURE_COLUMNS: tuple[str, ...] = _SQL_FEATURES if SQL_FEATURES_ENABLED else ()
+# What the model actually consumes: raw request features + engineered ones.
+# FEATURE_COLUMNS stays the raw input schema (download/validate/drift/API body).
+MODEL_FEATURE_COLUMNS: tuple[str, ...] = FEATURE_COLUMNS + SQL_FEATURE_COLUMNS
+# Engineered features are scaled too (they live on very different ranges, which
+# matters for the logistic-regression candidate).
+MODEL_SCALED_COLUMNS: tuple[str, ...] = SCALED_COLUMNS + SQL_FEATURE_COLUMNS
+HOURLY_STATS_PATH: Path = MODELS_DIR / "hourly_amount_stats.json"
+
+# Candidate model families for the training comparison (see train.py).
+MODEL_TYPES: tuple[str, ...] = ("xgboost", "lightgbm", "logreg", "random_forest")
 
 
 @dataclass(frozen=True)
@@ -204,7 +244,7 @@ class PreprocessConfig:
 
 @dataclass(frozen=True)
 class TrainConfig:
-    """XGBoost hyperparameters for the training stage."""
+    """Training-stage settings: model family + shared hyperparameters."""
 
     n_estimators: int
     max_depth: int
@@ -222,13 +262,29 @@ class TrainConfig:
     # floor) or "cost" (minimise expected cost = cost_fn*FN + cost_fp*FP, the
     # business framing of fraud's asymmetric error costs).
     threshold_strategy: str = "recall"
-    cost_fn: float = 10.0   # cost of a missed fraud (false negative)
-    cost_fp: float = 1.0    # cost of a false alarm (false positive)
+    cost_fn: float = 10.0  # cost of a missed fraud (false negative)
+    cost_fp: float = 1.0  # cost of a false alarm (false positive)
     # Probability calibration fit on validation: "none" or "isotonic". XGBoost
     # with scale_pos_weight emits distorted scores; isotonic makes the reported
     # probability trustworthy. Rank-preserving, so roc_auc/avg_precision are
     # unchanged. Applied transparently at serving via the pyfunc wrapper.
     calibration: str = "none"
+    # Which model family to train: one of MODEL_TYPES, or "auto" to train every
+    # family in ``candidates`` (one MLflow run each) and keep the best one by
+    # ``selection_metric`` on the validation split.
+    model_type: str = "auto"
+    candidates: tuple[str, ...] = MODEL_TYPES
+    selection_metric: str = "avg_precision"  # PR-AUC: right metric at 577:1
+
+    def __post_init__(self) -> None:
+        """Validate the model-family settings early (fail fast on a typo)."""
+        object.__setattr__(self, "candidates", tuple(self.candidates))
+        allowed = set(MODEL_TYPES) | {"auto"}
+        if self.model_type not in allowed:
+            raise ValueError(f"model_type={self.model_type!r} not in {allowed}")
+        unknown = set(self.candidates) - set(MODEL_TYPES)
+        if unknown or not self.candidates:
+            raise ValueError(f"bad candidates {self.candidates!r}")
 
 
 @dataclass(frozen=True)

@@ -39,7 +39,7 @@ from sklearn.metrics import (
 from src.config import (
     BENCHMARK_TARGETS,
     EVAL_METRICS_PATH,
-    FEATURE_COLUMNS,
+    MODEL_FEATURE_COLUMNS,
     MODELS_DIR,
     REGISTERED_MODEL_NAME,
     TARGET_COLUMN,
@@ -180,7 +180,7 @@ def _load_production_model() -> Model | None:
 
 def _score(model: Model, frame: pd.DataFrame, threshold: float) -> dict[str, float]:
     """Score a loaded pyfunc model on a feature/target frame."""
-    probs = np.asarray(model.predict(frame[list(FEATURE_COLUMNS)]))
+    probs = np.asarray(model.predict(frame[list(MODEL_FEATURE_COLUMNS)]))
     return compute_metrics(frame[TARGET_COLUMN], probs, threshold)
 
 
