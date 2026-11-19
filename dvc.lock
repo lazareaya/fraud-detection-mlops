@@ -1,0 +1,171 @@
+schema: '2.0'
+stages:
+  download:
+    cmd: python src/data/download.py
+    deps:
+    - path: src/data/download.py
+      hash: md5
+      md5: 8984be7548ddf39edb9b0748c56a7395
+      size: 7557
+    outs:
+    - path: data/raw/creditcard.csv
+      hash: md5
+      md5: 80099890a980c8e6a446b330467c01f7
+      size: 153082945
+  validate:
+    cmd: python src/data/validate.py
+    deps:
+    - path: data/raw/creditcard.csv
+      hash: md5
+      md5: 80099890a980c8e6a446b330467c01f7
+      size: 153082945
+    - path: src/data/validate.py
+      hash: md5
+      md5: 475d41e7dbba875e128892ab63d7f821
+      size: 3990
+    outs:
+    - path: data/validated/creditcard/validation_report.json
+      hash: md5
+      md5: e75804e6b4031503817e4f2b4b4e3a77
+      size: 119
+  preprocess:
+    cmd: python src/data/preprocess.py
+    deps:
+    - path: data/raw/creditcard.csv
+      hash: md5
+      md5: 80099890a980c8e6a446b330467c01f7
+      size: 153082945
+    - path: data/validated/creditcard/validation_report.json
+      hash: md5
+      md5: e75804e6b4031503817e4f2b4b4e3a77
+      size: 119
+    - path: src/data/features.py
+      hash: md5
+      md5: 90220904583907a5f11719e1051e3349
+      size: 5271
+    - path: src/data/preprocess.py
+      hash: md5
+      md5: 646bde0acf37616cbfa892276d4fb0f2
+      size: 7876
+    params:
+      params.yaml:
+        features.sql_features: true
+        preprocess.random_seed: 42
+        preprocess.split_strategy: stratified
+        preprocess.test_size: 0.15
+        preprocess.time_column: Time
+        preprocess.val_size: 0.15
+    outs:
+    - path: data/processed/creditcard/reference.parquet
+      hash: md5
+      md5: 5fa8f08aab8d78781de92feae437a030
+      size: 12032140
+    - path: data/processed/creditcard/test.parquet
+      hash: md5
+      md5: 3fdccd6dbc19ec1607ca3654493d9f3e
+      size: 12858128
+    - path: data/processed/creditcard/train.parquet
+      hash: md5
+      md5: c982f623966f426f3724b431b794d42d
+      size: 56092506
+    - path: data/processed/creditcard/val.parquet
+      hash: md5
+      md5: 50561cbaae423f70cdced89606c13796
+      size: 12866661
+    - path: models/creditcard/hourly_amount_stats.json
+      hash: md5
+      md5: 33b98826c21b9c5540db878e5ef80789
+      size: 771
+    - path: models/creditcard/scaler.pkl
+      hash: md5
+      md5: 659dd507d47f4b87354dc47d45e903c6
+      size: 625
+  train:
+    cmd: python src/models/train.py
+    deps:
+    - path: data/processed/creditcard/test.parquet
+      hash: md5
+      md5: 3fdccd6dbc19ec1607ca3654493d9f3e
+      size: 12858128
+    - path: data/processed/creditcard/train.parquet
+      hash: md5
+      md5: c982f623966f426f3724b431b794d42d
+      size: 56092506
+    - path: data/processed/creditcard/val.parquet
+      hash: md5
+      md5: 50561cbaae423f70cdced89606c13796
+      size: 12866661
+    - path: src/models/evaluate.py
+      hash: md5
+      md5: 2dc5620709996dffded235b38f0a3470
+      size: 11666
+    - path: src/models/train.py
+      hash: md5
+      md5: b753f3588ca1317206bd5c4671b5f8b1
+      size: 28400
+    params:
+      params.yaml:
+        features.sql_features: true
+        train.calibration: none
+        train.candidates:
+        - xgboost
+        - lightgbm
+        - logreg
+        - random_forest
+        train.colsample_bytree: 0.8
+        train.cost_fn: 10.0
+        train.cost_fp: 1.0
+        train.learning_rate: 0.05
+        train.max_depth: 4
+        train.min_recall: 0.85
+        train.model_type: auto
+        train.n_estimators: 400
+        train.random_seed: 42
+        train.scale_pos_weight: 24
+        train.selection_metric: avg_precision
+        train.subsample: 0.8
+        train.threshold_strategy: recall
+    outs:
+    - path: metrics/creditcard/model_comparison.json
+      hash: md5
+      md5: 55cdd9c6f43460327bed0d9f054734b1
+      size: 3420
+    - path: metrics/creditcard/train_metrics.json
+      hash: md5
+      md5: eb33847ac4572b9e4d032d182a909a54
+      size: 306
+    - path: models/creditcard/threshold.json
+      hash: md5
+      md5: 5b0ea63d368d5ce4853fadf2fe5fd7ec
+      size: 38
+  evaluate:
+    cmd: python src/models/evaluate.py --stage holdout
+    deps:
+    - path: data/processed/creditcard/test.parquet
+      hash: md5
+      md5: 3fdccd6dbc19ec1607ca3654493d9f3e
+      size: 12858128
+    - path: models/creditcard/threshold.json
+      hash: md5
+      md5: 5b0ea63d368d5ce4853fadf2fe5fd7ec
+      size: 38
+    - path: src/models/evaluate.py
+      hash: md5
+      md5: 2dc5620709996dffded235b38f0a3470
+      size: 11666
+    outs:
+    - path: metrics/creditcard/eval_metrics.json
+      hash: md5
+      md5: 7c905fcd7202f85952a8acf82ff67623
+      size: 280
+  promote:
+    cmd: python scripts/promote_model.py --promote staging-to-prod
+    deps:
+    - path: metrics/creditcard/eval_metrics.json
+      hash: md5
+      md5: 7c905fcd7202f85952a8acf82ff67623
+      size: 280
+    - path: scripts/promote_model.py
+      hash: md5
+      md5: 9ab01b27b4ff03809a3b87a692104804
+      size: 5581
