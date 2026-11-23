@@ -92,17 +92,6 @@ precision with recall ≥ 0.85 on validation). Reproduce with
 - **Logistic regression** reaches a high ROC-AUC (0.97) but a much lower PR-AUC
   — a textbook illustration of why ROC-AUC is misleading under heavy imbalance.
 
-## Live API
-
-> **Live demo:** _deploy on Render (see [Deployment](#deployment)) and paste the
-> public URL here_ — e.g. `https://fraud-detection-mlops-api.onrender.com/docs`
-
-```bash
-curl -X POST https://<your-service>.onrender.com/predict \
-     -H "Content-Type: application/json" -d @tests/sample_transaction.json
-# {"fraud_probability":0.996,"is_fraud":true,"threshold_used":0.0875,...}
-```
-
 ## What I added
 
 This project started from an MIT-licensed MLOps pipeline (see [Credits](#credits))
@@ -127,8 +116,8 @@ that trained a single XGBoost model. My contributions:
 3. **Experiment: with vs without SQL features** across all 4 models
    ([scripts/compare_feature_sets.py](scripts/compare_feature_sets.py)): the
    results table above.
-4. **Deployment & CI**: Render blueprint ([render.yaml](render.yaml)) for the
-   self-contained API image; CI trimmed to the workflows that run without
+4. **Deployment-ready image & CI**: Render blueprint ([render.yaml](render.yaml))
+   for the self-contained API image; CI trimmed to the workflows that run without
    secrets (lint + mypy + tests with ≥ 80 % coverage, real-data quality gate,
    e2e smoke); lockfiles and Docker images updated (LightGBM, DuckDB).
 5. **Tests** for every addition ([tests/test_features.py](tests/test_features.py),
@@ -165,7 +154,7 @@ python src/monitoring/detect_drift.py --simulate-drift
 
 ## Deployment
 
-The API is deployed from [Dockerfile.demo](Dockerfile.demo), a self-contained
+The API can be deployed from [Dockerfile.demo](Dockerfile.demo), a self-contained
 image that downloads the public data, runs the pipeline (4-model comparison
 included) **at build time** and serves the winning model: no secrets, no
 tracking server, and it fits Render's free tier.
